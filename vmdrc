@@ -1,0 +1,1357 @@
+#!~/.vmdrc
+############################################################################
+# VMD startup script,  executed as soon as VMD starts up                   #
+############################################################################
+
+# The vmdprefs package can overwrite this file.  To avoid this, make a
+#	directory plugins/noarch/tcl/BROKEN, and move
+#	plugins/noarch/tcl/vmdprefs* into it.
+
+namespace eval RC {
+
+variable labeloffset 0.002 labelatom -1 label_hide_show hide
+variable rotate 1 scale 0.1 translate 0.1;  # degree size distance
+if {![info exists pickmolrep]} {
+	variable pickmolrep [list] pick_mol_atom_l [list]
+}
+if {![array exists emph]} {
+	variable emph
+	array set emph { f.l {} f.rep "" f.i 0	r.l {} r.rep "" r.i 0
+		a.l {} a.rep "" a.i 0	b.l {} b.rep "" b.i 0 memory {}}
+}
+variable translate_switch
+array set translate_switch {0.05 0.1 0.1 0.5 0.5 2.0 "" 0.05}
+variable animate_skip_switch
+array set animate_skip_switch {1 10 10 100 100 1000 "" 1}
+variable axes_location_switch
+array set axes_location_switch {
+	Off Origin	Origin LowerLeft	LowerLeft LowerRight
+	LowerRight UpperLeft	UpperLeft UpperRight	UpperRight Off	"" Off}
+
+## Useful proc that will be exported (used to be vmdnamd/lib/base.tcl)
+
+# `ReadTable` and `WriteTable` are for sharing data with R.
+proc ReadTable {fn {layout line} {comment "#"}} {
+	if {![file exists $fn]} {
+		puts "ReadTable) File not exists, return empty: $fn!";
+		return [list];
+	};
+	set in [open $fn r];
+	set line_l [split [read -nonewline $in] \n];
+	close $in;
+	foreach line $line_l {
+		if {0!=[string first $comment $line]} {
+			lappend cleaned_line_l $line;
+		} else {
+			lappend comment_line_l $line;
+		};
+	};
+	set line_l $cleaned_line_l;
+	set return_l [list];
+	if {"line" eq $layout} {
+		return $line_l; # need not further parsing.
+	} elseif {"xsc" eq $layout} {
+		set fieldname_l [lrange [lindex $comment_line_l 1] 1 end];
+		# #$LABELS step a_x ...
+		foreach field [lindex $line_l 0] fname $fieldname_l {
+			lappend return_l $fname $field;
+		};
+		return $return_l;
+	} elseif {"header" eq $layout} {
+		set fieldname_l [lindex $line_l 0];
+		set line_l [lrange $line_l 1 end];
+		foreach line $line_l {
+			set rowname [lindex $line 0];
+			foreach field [lrange $line 1 end] fname $fieldname_l {
+				lappend return_l $rowname,$fname $field;
+			};
+		};
+		# $return_l is usually returned and passed to array set.
+	} elseif {"paired" eq $layout} {
+		foreach line $line_l {
+			set rowname [lindex $line 0];
+			set value_start [string length $rowname];
+			lappend return_l $rowname [string trim [
+				string range $line $value_start end]];
+		};
+	} else {
+		error "!!Unsupport layout: $layout!";
+	};
+	return $return_l;
+};
+proc WriteTable {fn data {layout row} {format %f} {head {}} {tail {}}} {
+# format: format used for integer, double, and empty. 
+#	After the end of short lists, fields is printed as empty.
+#	Format for empty could be like "." or "--" to help ReadTable.
+	if {1==[llength $format]} { set format "$format $format" }
+	if {2==[llength $format]} { set format "$format \{\}" }
+	proc Format "value {format {$format}}" {
+		return [format [expr {""eq$value?[lindex $format 2]:
+			[string is integer $value]?[lindex $format 0]:
+			[string is double $value]?[lindex $format 1]:"%s"}
+			] $value]
+	}
+	set out [open $fn w];
+	if {0<[llength $head]} {puts $out [join $head \n]};
+	if {"column" eq $layout} { # column-wise, like Fortran and R
+		set numline [llength [lindex $data 0]];
+		set numfield [llength $data];
+		for {set j 0} {$numline>$j} {incr j} {
+			for {set i 0} {$numfield>$i} {incr i} {
+				puts -nonewline $out [
+					Format [lindex $data $i $j]]\t;
+			};
+			puts $out "";
+		};
+	} elseif {"row" eq $layout} { # row-wise, like C, C++, and NumPy
+		foreach line $data {
+			foreach value $line {
+				puts -nonewline $out [Format $value]\t;
+			};
+			puts $out "";
+		};
+	} elseif {"raw" eq $layout} {
+		puts $out $data;
+	} elseif {"line" eq $layout} {
+		puts $out [join $data \n];
+	} else {
+		error "!!Unsupport layout: $layout!";
+	};
+	if {0<[llength $tail]} {puts $out [join $tail \n]};
+	close $out;
+	return $fn;
+};
+
+# Help [measure fit s_move s_fix order $order].
+# VMD always follows index or serial.  For molecules other than protein and
+#	DNA, atom index has nothing to do with the coordinates (no sequence).
+#	To use [measure fit], I manually check the coordinates of atoms, give
+#	two lists, elements in which correspond to each other.
+proc Order {index1_l index_l} {
+	if {"?" eq $index1_l} {
+		puts "Order) index1_l for s_move, index_l for s_fix!";
+		puts {
+		A $order list {A B C D} means:
+		(Correct) what item in the new list comes from (in the new
+		list, 1st item is [lindex $index_l A], 2nd item is [lindex
+		$index_l B] ...);  NEVER the inverse:
+		(WRONG) where an item in $index_l will be put
+		([lset order A [lindex $index_l 0]], ...).
+		};
+		return;
+	}
+	if {[llength $index1_l]!=[llength $index_l]} {
+		error "!!List should have the same length!";
+	}
+	foreach i1 $index1_l i $index_l {
+		if {0<[llength [array names correspond -exact $i1]] &&
+			$correspond($i1)!=$i} {
+			error "!!Two lists are ambiguous: {$i1} {$i}!";
+		};
+		set correspond($i1) $i;
+	}
+	set j -1;
+	foreach i [lsort -real -unique $index_l] {
+		set order_of_VMD($i) [incr j];
+	}
+	set order_l [list]
+	foreach i1 [lsort -real -unique $index1_l] {
+		lappend order_l $order_of_VMD($correspond($i1))
+	}
+	return $order_l;
+}
+
+proc Vars {} {
+	uplevel 1 {
+		foreach v [lsort [info vars]] {
+			if {[array exists $v]} {
+				puts $v:
+				foreach n [lsort [array names $v]] {
+				puts "\t$n=[string range [set ${v}($n)] 0 [
+					expr {70-[string length $n]}]];"
+			}
+			} else {
+				puts "$v=[string range [set $v] 0 [
+					expr {75-[string length $v]}]];"
+			}
+		}
+	}
+}
+
+# Create dummy atoms, which can be referred by `measure bond|angle|dihed`
+#	assisting the measurement of non atoms points, such as mass centers.
+# If need different atoms for destinguishing, call (for example) Dummy with
+#	name={N O _ _ S P Z LP H DRUD C X}
+proc Dummy "{num 1} {name DM} {resid 1} {fname $env(TMPDIR)/DUMMY.pdb}" {
+set l \
+{ATOM  %  5d %-4s DUM X% 4d    %   8.3f%   8.3f%   8.3f  1.00  0.00      DUMM}
+set out [open $fname w]
+for {set i 1} {$num>=$i} {incr i} {
+	puts $out [format $l $i " [lindex $name [expr {$i%[llength $name]}]]" \
+		$resid [expr {rand()}] [expr {rand()}] [expr {rand()}]]
+}
+close $out
+set molid [mol new $fname]
+#file delete -- $fname
+return $molid
+}
+
+# Label of serial, which is the same as in pdb, so ease manually editing of pdb
+proc Label {{label "%s:%R%d%a"} {sel noh} {molid top} {new true}} {
+	if {0==[molinfo num]} {return};
+	set molid [molinfo $molid get id];
+	if {$new} { label delete Atoms all };
+	set S [atomselect $molid $sel];
+	if {0==[$S num]} { puts "Label) '$sel' select nothing!" }
+	set label_number [llength [label list Atoms]];
+	foreach index_ser [$S get {index serial}] {
+		foreach {index serial} $index_ser {break};
+		if {!$new} {
+			set label_l [label list Atoms];
+			set idx [lsearch -index 0 $label_l "{$molid $index}"];
+			if {-1<$idx} {
+				label delete Atoms $idx;
+				incr label_number -1;
+			};
+		}; # if $molid/$index has a label, new label cannot be added.
+		label add Atoms $molid/$index;
+		label textformat Atoms $label_number [string map [list %s \
+			$serial] $label]; # VMD not use %s, and no % for serial
+		label textoffset Atoms $label_number {0 0}; # on the atom
+		incr label_number 1;
+	}
+	$S delete
+	label textsize 1.0;
+	label textthickness 1.2;
+	return;
+};
+
+proc Fit {{sel ""} {frame0 now} {mol top} {mol0 top} {sel0 ""} {order {}}} {
+	if {"" eq $sel}  { set sel  "protein and name CA" }
+	if {"" eq $sel0} {
+		set sel0 $sel
+	} elseif {[regexp {^([+-]\d+) resid (.*)$} $sel0 x offset resid]} {
+		# convinient to compare proteins with different resid offsets.
+		set resid0 ""
+		foreach k $resid {
+			if {[string is integer -strict $k] } {
+				append resid0 [expr {$k+$offset}] " "
+			} else {
+				append resid0 "$k "
+			}
+		}
+		set sel0 "($sel) and (resid $resid0)"
+		set sel  "($sel) and (resid $resid)"
+		puts "Fit) sel=$sel; sel0=$sel0!"
+	}
+	set M  [atomselect $mol  all]
+	set S  [atomselect $mol  $sel]
+	set S0 [atomselect $mol0 $sel0 frame $frame0]
+	if {[$S num]!=[$S0 num] || 0==[$S num]*[$S0 num]} {
+		puts "Fit) Cannot fit atoms of [$S num]!=[$S0 num]!"
+		return
+	}
+	if {"top" ne $mol} { puts "Fit) mol $mol move!" }
+	set numframes [molinfo $mol get numframes]
+	if {0<[llength $order]} {
+		puts "Fit) use $order to reorder the atoms in $mol"
+		foreach a [$S get {index name resid}] a0 [
+				$S0 get {index name resid}] {
+			puts "Fit) $a\t\t$a0;"
+		}
+		for {set f 0} {$f<$numframes} {incr f} {
+			$S frame $f
+			$M frame $f
+			$M move [measure fit $S $S0 order $order]
+		}
+	} else {
+		for {set f 0} {$f<$numframes} {incr f} {
+			$S frame $f
+			$M frame $f
+			$M move [measure fit $S $S0]
+		}
+	}
+	foreach V {S0 S M} {[set $V] delete}
+	return
+}
+
+# Measure the closest distance of S1 and S2, which are atomselection.
+#	For measuring distance of atoms, use `measure bond`;
+#	For measuring defined centers, like mass center, use
+#	`vecdist [measure center $S1] [measure center $S2]`
+proc MeasureDist {S1 S2 {first now} {last now}} {
+	foreach S {S1 S2} { set memory($S.frame) [[set $S] frame] }
+	set cutoff [expr {[vecdist [measure center $S1] [measure center $S2]]
+		-[measure rgyr $S1]-[measure rgyr $S2]}]
+	set dist_l [list]
+	foreach v {first last} {
+		if {"now" eq [set $v]} {set $v [molinfo top get frame]}
+	}
+	foreach v {first last} {
+		if {"last" eq [set $v]} {set $v [molinfo top get numframes]}
+	}
+	for {set f $first} {$last>$f} {incr f} {
+		foreach S [list $S1 $S2] { $S frame $f ; $S update }
+		set cutoff_old $cutoff;
+		while {1} {
+			foreach {idxa idxb} [
+				measure contacts $cutoff $S1 $S2] {break}
+			# $cutoff too large make ERROR) vmdgridsearch3:
+			#	exceeded pairlist sanity check, aborted
+			# The ERROR is harmless, but measure returns less
+			#	contacts (stop collecting at maxpairs=93690).
+			if {[llength $idxa]>0} {
+				break
+			} else {
+				set cutoff [expr {$cutoff*2-$cutoff_old+1}]
+			}
+		}
+		set dist [expr {$cutoff*2}]
+		foreach a $idxa b $idxb {
+		       set d [measure bond [list $a $b] frame $f]
+		       set dist [expr {$d<$dist?$d:$dist}]
+		}
+		lappend dist_l $dist
+		set cutoff $dist
+	}
+	foreach S {S1 S2} { [set $S] frame $memory($S.frame) ; [set $S] update }
+	return $dist_l
+}
+
+namespace export ReadTable WriteTable Order Vars Dummy Label Fit State Render Load Save Rep MeasureDist
+
+
+## Adding proc for Hotkey
+
+proc Pick {args} {
+# Arguments is required.
+# If callback fail, stop at frist error without any message.
+# For 'mouse mode pick' ('mouse mode pick [0-9c]' not set $vmd_pick_event)
+	variable pickmolrep
+	variable pick_mol_atom_l
+	global vmd_pick_event vmd_pick_mol vmd_pick_atom vmd_pick_shift_state
+	#puts "RC) vmd_pick_mol=$vmd_pick_mol; vmd_pick_atom=$vmd_pick_atom!"
+	if {$vmd_pick_mol!=[molinfo top]} { return }
+	if {0==$vmd_pick_shift_state} {
+		lappend pickmolrep [concat $vmd_pick_mol [Rep add [
+			list CPK Name "same residue as index $vmd_pick_atom"]]
+		set S [atomselect $vmd_pick_mol "index $vmd_pick_atom"]
+		lappend pick_mol_atom_l [concat $vmd_pick_mol $vmd_pick_atom [
+			$S get {resname resid index name}]]
+		$S delete
+	} else {
+		lappend pickmolrep [concat $vmd_pick_mol [Rep add [
+			list CPK Name "within 5 of index $vmd_pick_atom"]]
+	}
+}
+
+proc Move {{offset {0 0 0}}} {
+	variable emph
+	variable move
+	array set move {}
+	if {-1==[molinfo top]} { return }
+	if {![info exists move(S)] || ![string match {atomselect*} $move(S)]} {
+		Emph a 0
+		set move(S) [atomselect top "same fragment as [
+			lindex $emph(a.l) $emph(a.i)]"]
+		$move(S) uplevel 1
+	}
+	#if {![info exists move(memory)]} {
+	#	set move(memory) [list [molinfo top] [
+	#		$move(S) get index] [$move(S) get {x y z}]]
+	#}
+	if {3==[llength $offset]} {
+		set m [transoffset $offset]
+	} elseif {2==[llength $offset]} {
+		foreach {ax angle} $offset {break}
+		array set axis {x {1 0 0} y {0 1 0} z {0 0 1}}
+		if {![info exists move(center)]} {
+			set move(center) [measure center $move(S)]
+		}
+		if {3==[llength $ax]} {
+			set move(center2) $ax
+		} elseif {[info exists $axis($ax)]} {
+			set move(center2) [vecadd $move(center) $axis($ax)]
+		} elseif {![info exists move(center2)]} {
+			set move(center2) {0 0 0}
+		}
+		set m [trans bond $move(center) $move(center2) $angle deg]
+	} else {
+		set m [transidentity]
+	}
+	$move(S) move $m
+	return
+}; # mimicking mouse mode move; need 12 keys to implement all degrees of freedom
+
+proc LabelAtom {{incr 0}} {
+	variable labelatom
+	variable labeloffset
+	set label_l [label list Atoms]
+	set mtop [molinfo top]
+	set ilabel [lsearch -all -index {0 0} -integer $label_l $mtop]
+	if {0==[llength $ilabel]} {
+		set labelatom -1
+	} elseif {1==[llength $ilabel]} {
+		label show Atoms $ilabel
+		set labelatom $ilabel
+	} else {
+		set show_l [list]
+		foreach iilabel $ilabel {
+			if {"show"==[lindex $ilabel $iilabel 2]} {
+				lappend show_l $iilabel
+			}
+		}
+		if {0==[llength $show_l]} {
+		} elseif {1==[llength $show_l]} {
+			label hide Atoms
+		} elseif {1<[llength $show_l]} {
+			set ilabel $show_l
+		}
+		set iilabel [lsearch -all -integer $ilabel $labelatom]
+		if {1!=[llength $iilabel]} {
+			#puts "RC) LabelAtom: $ilabel; $labelatom; $iilabel!"
+			# When labelatom=-1 or just switched from other mol
+			set iilabel -1; # same as [llength $ilabel]-1
+		}
+		set labelatom [lindex $ilabel [
+			expr {($iilabel+$incr)%[llength $ilabel]}]]
+		# cycle through $ilabel, if 0!=incr
+		label show Atoms $labelatom
+		# need highlight the selected label
+	}
+	return $labelatom
+}
+
+proc LabelTranslate {offset} {
+	set a [LabelAtom]
+	if {-1<$a} {
+		label textoffset Atoms $a [vecadd [
+			label textoffset Atoms $a] $offset]
+	}
+}
+
+proc State {{verbose 0}} {
+	if {0<[molinfo num]} { set name [molinfo top get {name id frame}]
+		} else { set name [list VMD "" ""] }
+	lappend name [clock format [clock seconds] -format %Y%m%d%H%M%S]
+	if {0==$verbose} { return $name }
+	set mat {center_matrix rotate_matrix scale_matrix global_matrix}
+	# These matrices are the same for all mol, if no one is fixed.
+	set state [list]; # less than [save_state], no label and graphics
+	lappend state "#!VMD"
+	lappend state "cd {[pwd]}"
+	set view [list]
+	foreach m [molinfo list] {
+		set f [molinfo $m get numframes]
+		if {0==[molinfo $m get drawn]} {
+			lappend state "Load; # $f frames; hide"
+			continue
+		}; # for keeping the top id meaningful
+		lassign [molinfo $m get {filename filetype filespec}] n t s
+		set file_l [list]
+		foreach nn $n tt $t ss $s {
+			lappend file_l [concat [list $nn $tt] $ss] }
+		lappend state "Load [molinfo $m get {name frame}
+			] $file_l; # $f frames"
+		set rep_l [list]
+		for {set r 0} {$r<[molinfo $m get numreps]} {incr r} {
+			if {0==[mol showrep $m $r]} { continue }
+			set rep [molinfo $m get \
+			"{rep $r} {color $r} {selection $r} {material $r}"]
+			# {rep0} sometimes results in "out of range".
+			lappend rep [
+				mol colupdate $r $m] [
+				mol selupdate $r $m] [
+				mol drawframes   $m $r] [
+				mol smoothrep    $m $r] [
+				mol scaleminmax  $m $r] [
+				mol numperiodic  $m $r] [
+				mol showperiodic $m $r];
+			#lappend rep [mol clipplane]
+			lappend rep_l $rep
+		}
+		lappend state "Rep new $rep_l"
+		lappend state "molinfo top set {fixed active} {[
+			molinfo $m get {fixed active}]}"
+		lappend view "molinfo $m set {$mat} {[molinfo $m get $mat]}"
+		#set view [molinfo $m get $mat]
+		# `moinfo set` only uses these elements in matrices:
+		#lappend state "molinfo top set center {{[list [
+		#	lindex $view 0 0 3
+		#	] [lindex $view 0 1 3] [lindex $view 0 2 3]]}}"
+		#lappend state "molinfo top set rotate_matrix {{[lindex $view 1
+		#	]}}"
+		#lappend state "scale to [        lindex $view 2 0 0]"
+		#lappend state "translate to [    lindex $view 3 0 3] [
+		#	lindex $view 3 1 3] [lindex $view 3 2 3]"
+		#lappend state "#view_matrix {[  lindex $view 4
+		#	]}"; # view_matrix cannot be set
+		#lappend state "molinfo top set {[lrange $mat 5 6]} {[
+		#	lrange $view 5 6]}"
+	}
+	lappend state {*}$view
+	lappend state "mol top [molinfo top]"
+	return [list $name [join $state \n]]
+}
+
+# `Render *.png`: PNG that saved previously, extracting the previous state;
+# `Render ""`: generate new PNG file with the state.
+proc Render {{save ""}} {
+	if {"" ne $save} {
+		if {![file exists $save]} {
+			error "Render) $save not exist!"
+		}
+		set state_l [split [exec identify -verbose $save] \n]
+		set s [lsearch -glob           $state_l "    comment: *"]
+		set e [lsearch -glob -start $s $state_l "    date:create: *"]
+		if {-1==$e} {
+			return
+		} else {
+			set state [string range [join [
+				lrange $state_l $s [expr {$e-1}]] \n] 13 end]
+			return [exec base64 --decode <<$state | zcat]
+			
+		}
+	}; # recover [lindex $state 1] in the comment of PNG
+	set state [State 1]
+	#render TachyonInternal vmdscene.tga display %s
+	#render POV3 plot.pov povray +W600 +H400 -I%s -O%s.png +A +FN16
+        #render Tachyon plot.dat tachyon -aasamples 12 %s -format PNG -o 0.png
+	# better but may be different (e.g., labels) from screen view.
+	render snapshot vmdscene.tga convert -comment "[exec gzip <<[
+		lindex $state 1] | base64 --wrap=0]" %s [join [
+		lindex $state 0] -].png
+	# quality depends on device, such as GLSL etc.
+	# command for render need special quoting for shell (it invokes
+	#	<stdlib.h> system() instead of Tcl/Tk `exec`,
+	#	see FileRenderList.C), when its arguments (including
+	#	substituted %s) contains special characters like " ;$"'`()",
+	#	for example use `-comment "'[lindex $state 1]'"` or base64().
+	#	May even encrypt the $state here.
+	# VMD by default uses `display %s`, thus depends on ImageMagick,
+	#	`convert` also come from ImageMagick.
+	return [lindex $state 0]
+}
+
+proc Save {fout sel {molid top} {chain ""}} {
+	set Sel [atomselect $molid $sel];
+	if {"" ne $chain} {
+		set memory [$Sel get chain];
+		$Sel set chain $chain;
+	};
+	set suffix [file extension $fout]
+	if {"pdb" eq $suffix} { $Sel writepdb $fout
+	} elseif {} {
+	}
+	if {"" ne $chain} {
+		$Sel set chain $memory;
+	};
+	$Sel delete;
+	return $fout;
+}
+
+proc Load {frame args} {
+	if {[string is integer -strict $frame]} {
+		set name ""
+	} elseif {[string is list -strict $frame]} {
+		lassign $frame name frame
+	}
+	mol new
+	foreach file $args {
+		set spec [lassign $file n t]
+		if {"" eq $t} {
+			mol addfile $n waitfor all
+		} else {
+			mol addfile $n type $t {*}$spec waitfor all
+		}
+	}
+	if {"" ne $name} { mol rename top $name }; # `molinfo set name` not work
+	if {"" ne $frame} { molinfo top set frame $frame }
+	return [molinfo top get numframes]
+}
+
+proc Rep {args} {
+# If want make something transparent, use rep Dotted with mat Opaque is
+#       good in Xorg, while use rep VDW with mat Ghost is better in Tachyon.
+        if {-1<[lsearch -exact {new add} [lindex $args 0]]} {
+		set args [lassign $args new]
+	} else {
+		set new new
+	}
+	if {"new" eq $new} {
+		for {set i 0} {[molinfo top get numreps]>$i} {incr i} {
+			mol delrep 0 top
+		}; # `mol delrep all top` not work
+	}
+	lassign {"" "" "" "" 0 0 now 1 auto 1 ""} \
+		r c s m cup sup f smooth mm np showp
+	set repname [list]
+	foreach rep $args {
+		lassign $rep r1 c1 s1 m1 cup1 sup1 f1 smooth1 mm1 np1 showp1
+		# $rep can be shorter than this
+                if {[regexp {^atomselect[0-9]+$} $s]} { set s [$s text] }
+		foreach k {r c s m f smooth mm sup cup np showp} {
+			set $k [expr {"" eq [set ${k}1]?[set $k]:[set ${k}1]}]
+		}; # if "", use the previous one or even VMD default;
+                set i [molinfo top get numreps]; # track repid
+		mol addrep top; # return null, so I have to use $i
+                mol modstyle    $i top $r
+                mol modcolor    $i top [
+			expr {[string is integer $c]?"ColorID $c":"$c"}]
+                mol modselect   $i top $s
+                mol modmaterial $i top $m
+		mol colupdate   $i top $cup
+		mol selupdate   $i top $sup
+		mol drawframes   top $i $f
+		mol smoothrep    top $i $smooth
+		mol scaleminmax  top $i {*}$mm
+		mol numperiodic  top $i $np
+		mol showperiodic top $i $showp
+		lappend repname [mol repname top $i];
+	}
+        return $repname;
+}
+
+proc Rep.old {new sel_l rep_l col_l {mat_l {"Opaque"}}} {
+# Add or change representation. rep, col, and mat can be a word, a list, or
+#       empty: if word, it will repeatly used; if list, sel and rep and others
+#       should match; if empty, use default setting.
+        set lsel_l [llength $sel_l];
+        foreach k {rep col mat} {
+                if {1==[llength [set ${k}_l]]} {
+                        set ${k}_l [lrepeat $lsel_l [lindex [set ${k}_l] 0]];
+                }
+                if {[llength [set ${k}_l]]!=$lsel_l} {
+                        error "!!Rep $k: $sel_l!=[set ${k}_l]!";
+                }
+        }
+        if {"new" eq $new} {
+                set numreps [molinfo top get numreps];
+                for {set i 0} {$numreps>$i} {incr i} { mol delrep 0 top }
+        } elseif {"add" eq $new} {
+        };
+	set repname [list]
+        foreach sel $sel_l rep $rep_l col $col_l mat $mat_l {
+                if {[regexp {^atomselect[0-9]+$} $sel]} { set sel [$sel text] }
+                #mol selection $sel;
+                #mol representation $rep;
+                #mol color $col;
+                #mol material $mat;
+                set i [molinfo top get numreps]; # track repid
+		mol addrep top; # return null, so I have to use $i
+                mol modselect   $i top $sel;
+                mol modstyle    $i top $rep; # can be "", if so, use default
+                mol modcolor    $i top [expr {[string is integer $col]?
+                        "ColorID $col":"$col"}];
+                mol modmaterial $i top $mat;
+		lappend repname [mol repname top $i];
+        }
+        return $repname;
+}
+
+
+# Return Part of fragment: a list of atoms linked to $center but not $visited
+proc Part {center visited {depth 1}} {
+# Breadth-first search, non-recursive but using queue
+	while {0<$depth} {
+		set C [atomselect top "index $center"];
+		set bonded [join [$C getbonds]]; # getbonds is a list of lists
+		if {1} {	# $depth is meanless if enable this acceleration
+			set cnr [$C get {name resid}]
+			set ca [lsearch -all -inline -index 0 $cnr CA]
+			if {0<[llength $ca]} {
+				set c [list]
+				foreach r $ca { lappend c [lindex $r 1] }
+				set V [atomselect top \
+					"index $visited and name CA"]
+				if {0<[$V num]} {
+					set c [lsort -integer $c]
+					set v [lsort -integer [$V get resid]]
+					set BB [atomselect top "name CA [expr {
+						[lindex $v end]<[lindex $c 0]?
+						"and resid>[lindex $c end]":""}
+						] [expr {
+						[lindex $v 0]>[lindex $c end]?
+						"and resid<[lindex $c 0]":""}
+						] and not index $visited and\
+						same fragment as index $center"]
+					lappend bonded {*}[$BB get index]
+					$BB delete
+				}
+				$V delete
+			}
+		}; # accelerate by breadth-first search along backbone
+		$C delete
+		if {0==[llength $bonded]} { break }
+		lappend visited {*}$center
+		set B [atomselect top "index $bonded and not index $visited"]
+		set bonded [$B list]
+		$B delete
+		set visited [lsort -unique -integer [concat $visited $bonded]]
+		if {0==[llength $bonded]} { break }
+		set center $bonded
+		incr depth -1
+	}
+	return $visited
+}
+
+# Return Part of fragment.  This is recursive, breadth-first search.
+# Also see vmd/plugins/noarch/tcl/utilities1.0/utilities.tcl::bondedsel,
+#	which recursively search deep first due to the foreach and is slow.
+proc Part.recursive {center visited {depth 1}} {
+	if {$depth<1} { return };
+	set C [atomselect top "index $center"];
+	set bonded [join [$C getbonds]]; # getbonds is a list of lists
+	#puts "$depth: [llength $bonded]; [llength $center]; $visited"
+	if {1} {
+		set cnr [$C get {name resid}]
+		set ca [lsearch -all -inline -index 0 $cnr CA]
+		if {0<[llength $ca]} {
+			set c [list]
+			foreach r $ca { lappend c [lindex $r 1] }
+			set V [atomselect top "index $visited and name CA"]
+			if {0<[$V num]} {
+				set c [lsort -integer $c]
+				set v [lsort -integer [$V get resid]]
+				set BB [atomselect top "name CA [expr {
+					[lindex $v end]<[lindex $c 0]?
+					"and resid>[lindex $c end]":""}] [expr {
+					[lindex $v 0]>[lindex $c end]?
+					"and resid<[lindex $c 0]":""}
+					] and not index $visited and\
+					same fragment as index $center"]
+				lappend bonded {*}[$BB get index]
+				#puts "  $depth: [llength $bonded]; $c==$v?$ca"
+				$BB delete
+			}
+			$V delete
+		}
+	}; # accelerate the recursion by breadth-first search along backbone
+	$C delete
+	if {0==[llength $bonded]} { return }
+	lappend visited {*}$center
+	set B [atomselect top "index $bonded and not index $visited"]
+	set bonded [$B list]
+	$B delete
+	if {0==[llength $bonded]} { return $visited }
+	return [lsort -unique -integer [concat $visited [
+		Part.recursive $bonded $visited [expr {$depth-1}]]]]
+	# At an iteration, $center is the checked atom, $visited is the barrier
+	#	preventing further checking, and $bonded is the atoms that
+	#	will be checked at next iteration.
+}
+
+proc Dihedral {angle} {
+	variable dihedralpart
+	variable emph
+	if {"" eq $emph(b.rep)} { Emph b 0 }
+	set a [lindex $emph(a.l) $emph(a.i)]
+	set b [lindex $emph(b.l) $emph(b.i)]
+	if {$a eq $b} {
+		puts "RC) Dihedral: not for $a eq $b!"
+		return
+	}
+	set A [atomselect top $a]
+	set B [atomselect top $b]
+	if {"none"==$dihedralpart} {
+		set P [atomselect top "same fragment as index [$B list]"]
+		set maxdepth [$P num]; # inifite recursion if it has loop
+		$P delete
+		puts [time {
+		set dihedralpart "index [Part [$B list] [$A list] $maxdepth]"
+		}]
+		# including $a and $b (it does not matter)
+	};
+	# If $a and $b are in a cycle (such as disulfide bond), $ihedralpart
+	#	will be the entire cycle, but it does not matter because
+	#	now the entire cycle is rotated around bond $a-$b (instead
+	#	of fixing the part bonded to $a).
+	set C [atomselect top $dihedralpart]
+	if {1} {
+		set coordcc [coordtrans [trans bond [measure center $A] [
+			measure center $B] 1 pi] [measure center $C]]
+		draw material Transparent
+		set i [draw cone [vecscale 0.5 [
+			vecadd  [measure center $C] $coordcc]] [
+			measure center $B] resolution 72 radius [vecscale 0.5 [
+			vecdist [measure center $C] $coordcc]]]
+		after 100 draw delete $i
+	}; # for debug
+	$C move [trans bond [measure center $A] [measure center $B] $angle deg]
+	$A delete
+	$B delete
+	$C delete
+	return
+}
+
+# Emphasis a group (Fragment/Residue/Atom/Bonded) of atoms
+proc Emph {g {incr 0}} {
+	variable emph
+	if {-1==[molinfo top] || "x" eq $g} {return}
+	array set parent {f x r f a r b a}
+	array set child  {f r r a a b b x}
+	Emph $child($g) clear
+	if {"b" eq $g && "0" ne $incr} {
+		variable dihedralpart none
+	}
+	if {"clear" eq $incr} {
+		mol delrep [mol repindex top $emph($g.rep)] top
+		# -1==[mol repindex top ""], so never worry about it
+		set emph($g.rep) ""
+		set emph($g.l) {}
+		return
+	}
+	array set sel {
+		x all
+		f {[lindex $emph(f.l) $emph(f.i)]}
+		r {[lindex $emph(f.l) $emph(f.i)] and [
+			lindex $emph(r.l) $emph(r.i)]}
+		a {[lindex $emph(a.l) $emph(a.i)]}
+		b {[lindex $emph(a.l) $emph(a.i)] or [
+			lindex $emph(b.l) $emph(b.i)]}
+	}
+	if {0==[llength $emph($g.l)]} {
+		Emph $parent($g)
+		array set keyword {
+			f {chain segname fragment} r {resid} a {index} b {}}
+		# index is better than name for atom, because it is unique,
+		#	even there are two or more residues sharing a resid
+		#	(and all of segname '').
+		set A [atomselect top [
+			subst -nobackslashes -novariables $sel($parent($g))]]
+		foreach k $keyword($g) {
+			set v [$A get $k]
+			#set v [lsort -unique $v]; # not preserve the order
+			if {"a" ne $g} {
+				set u {}
+				foreach w $v {dict set u $w 0}
+				set v [dict keys $u]
+			}
+			foreach w $v {
+				if {"fragment" eq $k} {
+					set F [atomselect top "$k $w"]
+					if {1==[$F num]} {continue}
+				}; # no-interesting
+				if {[string is integer -strict $w]} {
+					lappend emph($g.l) "$k $w"
+				} else {
+					lappend emph($g.l) "$k '$w'"
+				}
+			}
+		}
+		if {"b"==$g} { # $keyword($g)={}
+			foreach b [lindex [$A getbonds] 0] {
+				lappend emph($g.l) "index $b"
+			}
+			if {0==[llength $emph($g.l)]} {
+				lappend emph($g.l) "index [$A list]"
+			}; # guarantee at least 1 bond (to itself)
+		}
+		$A delete
+	}
+	incr emph($g.i) $incr
+	array set style {f NewCartoon r CPK  a Dotted  b Licorice}
+	array set color {f ResType    r Name a Name    b Name}
+	if {"" eq $emph($g.rep)} {
+		set i [molinfo top get numreps]
+		mol addrep top
+		set emph($g.rep) [mol repname top $i]
+		mol modcolor $i top $color($g)
+		#mol modmaterial $i top "Transparent"
+		set emph($g.i) [expr {
+			$incr>0?0:[llength $emph($g.l)]-1}]
+	}
+	if {-1<$emph($g.i)&&[llength $emph($g.l)]>$emph($g.i)} {
+		set i [mol repindex top $emph($g.rep)]
+		set s [subst -nobackslashes -novariables $sel($g)]
+		mol modselect $i top $s
+		if {"f" eq $g} {
+			set S [atomselect top $s]
+			if {-1==[lsearch -exact [join [
+				$S get {protein nucleic}]] 1]} {
+				mol modstyle $i top CPK
+			} else {
+				mol modstyle $i top $style($g)
+			}
+			$S delete
+		} else {
+			mol modstyle $i top $style($g)
+		}
+		puts "$g: $s"
+	} else {
+		mol delrep [mol repindex top $emph($g.rep)] top
+		set emph($g.rep) ""
+		set s "none"
+	}
+	return $s
+}
+
+proc IncrTop {{incr 0}} {
+	if {-1<[molinfo top]} {
+		mol top [molinfo index [expr {([lsearch -integer [
+			molinfo list] [molinfo top]]+$incr)%[molinfo num]}]]
+			mol on top
+	} 
+}
+
+proc Cache {{start 1} {end end}} {
+	variable cache
+	return [string range $cache $start $end]
+}
+
+
+proc CacheMode {} {
+	variable cache ""
+	if {-1<[molinfo top]} {
+		variable cachedrawxyz {*}[molinfo top get center]
+	} else {
+		variable cachedrawxyz {0 0 0}
+	}
+	variable cachedraw [draw text $cachedrawxyz "!!In cache mode!"]
+	for {set i 1} {$i<0x80} {incr i} {
+		user add key [format %c $i] "draw replace \$RC::cachedraw;
+			draw text \$RC::cachedrawxyz \[
+				append RC::cache {[format %c $i]}\]"
+		# Space not work, but Tab work
+	}; # {Alt,Aux,Control}+key (untouched) can work the same in two modes.
+	user add key \b {
+		set RC::cache [string range $RC::cache 0 end-1]
+		draw replace $RC::cachedraw
+		draw text $RC::cachedrawxyz $RC::cache
+	}
+	user add key \x1B {
+		set RC::cache ""
+		draw replace $RC::cachedraw
+		draw text $RC::cachedrawxyz "!!Still in cache mode!"
+	}
+	foreach key {Insert \x7F} {
+		user add key $key {
+			set cache ""
+			draw replace $RC::cachedraw
+			draw text $RC::cachedrawxyz "!!Return to normal mode!"
+			after 500 draw delete $RC::cachedraw
+			RC::Hotkey $RC::dangerous_state
+		}; # Return to normal mode, discard the cache
+	}
+	user add key \r {
+		switch -regexp -- $RC::cache \
+		  {^$} {
+			set a "Nothing"
+		} {^A[0-9]+$}	{
+			set RC::animate [RC::Cache]
+			set a "Update animate default skip to [RC::Cache]"
+		} {^L([0-9]*\.[0-9]+|[0-9]+\.?)$}	{
+			set RC::labeloffset [RC::Cache]
+			set a "Update default labeloffset to [RC::Cache]"
+		} {^T[0-9]+$}	{
+			mol top [RC::Cache]
+			set a "set mol top [RC::Cache]"
+		} {^X[+-]?([0-9]*\.[0-9]+|[0-9]+\.?)?$} {
+			set RC::cachedrawxyz [vecadd $RC::cachedrawxyz \
+				"[RC::Cache] 0 0"]
+			set a "Update draw text x"
+		} {^Y[+-]?([0-9]*\.[0-9]+|[0-9]+\.?)?$} {
+			set RC::cachedrawxyz [vecadd $RC::cachedrawxyz \
+				"0 [RC::Cache] 0"]
+			set a "Update draw text y"
+		} {^Z[+-]?([0-9]*\.[0-9]+|[0-9]+\.?)?$} {
+			set RC::cachedrawxyz [vecadd $RC::cachedrawxyz \
+				"0 0 [RC::Cache]"]
+			set a "Update draw text z"
+		} default	{ 
+			set a "Syntax error"
+		}; # draw text only handle ASCII, by drawing not font
+		draw replace $RC::cachedraw
+		draw text $RC::cachedrawxyz "!!$a and return to normal mode!"
+		after 500 draw delete $RC::cachedraw
+		RC::Hotkey $RC::dangerous_state
+	}; # Process the cache, and return to normal mode
+}
+
+proc Hotkey {{dangerous 1}} {
+# dangerous: 0 - very safe, 1 - safe, deleting and fitting are allowed,
+#	2 - very dangerous, hotkeys that may change the coordinates
+#	of a few atoms thus non-undo-able and hard to detect are prohibited.
+variable dangerous_state $dangerous
+set vmd_hotkeys_tmp [display update status]; # not update during call to "user"
+display update off; # will be restore to its original state
+## Help messages for unassigned keys
+set msg {puts {HOTKEYS) Type 'user add key %s {commands...}' to use '%s' key!}}
+for {set i 1} {$i<0x80} {incr i} {
+	user add key [format %c $i] [
+		format $msg \\x[format %02X $i] [format %c $i]]
+	foreach mod { Alt Aux Control } {
+		user add key [format $mod-%c $i] [
+		format $msg $mod-\\x[format %02X $i] [format $mod-%c $i]]
+	}
+}; # keys in 0xFF00~0xFFFF (shown in xev(1)) cannot be assigned in this form.
+foreach key { Escape Up Down Left Right Page_Up Page_Down \
+		Home End Insert Delete} {
+	user add key $key [format $msg $key $key]
+}; # Page_Down, Escape and Delete is broken on Linux (use x1B and x7F instead)
+foreach key {r t b x1B x7F} name {Enter Tab Backspace Escape Delete} {
+	user add key [subst \\$key] [format $msg \\$key $name]
+}; # Works on Linux
+foreach key { 1 2 3 4 5 6 7 8 9 10 11 12 } {
+	user add key F$key [format $msg F$key F$key]
+}; # reserved for costomize of per-task defined
+## README
+## * Compartible to the original key bindings of VMD;
+## * Be careful to non-undo changes, such as [mol delete];
+## * VMD not respect the state of Caps_Lock;
+## * Free keys: qQvVnN:;'"<>\|*	F{1..12}
+## VI-LIKE ROTATION KEYS
+user add key j {rotate x by $RC::rotate}; # rotate down
+user add key k {rotate x by -$RC::rotate}; # rotate up
+user add key l {rotate y by $RC::rotate}; # rotate left
+user add key h {rotate y by -$RC::rotate}; # rotate right
+user add key g {rotate z by $RC::rotate}; # rotate couterclockwise
+user add key G {rotate z by -$RC::rotate}; # rotate clockwise
+user add key J {rotate x by 0.2}
+user add key K {rotate x by -0.2}
+user add key L {rotate y by 0.2}
+user add key H {rotate y by -0.2}
+user add key Control-j {rotate x by 15} 
+user add key Control-k {rotate x by -15}
+user add key Control-l {rotate y by 15} 
+user add key Control-h {rotate y by -15}
+user add key Control-g {rotate z by 15}; # rotate couterclockwise
+user add key i {scale by [expr {1+$RC::scale}]}; # zoom "i"n
+user add key o {scale by [expr {1/(1+$RC::scale)}]}; # zoom "o"ut
+user add key I {scale by 2.0}
+user add key O {scale by 0.5}
+user add key Control-i {scale by 1.01}
+user add key Control-o {scale by 0.990991}
+## EMACS-LIKE ROTATION KEYS
+#user add key Control-n {rotate x by 2}
+#user add key Control-p {rotate x by -2}
+#user add key Control-f {rotate y by 2}
+#user add key Control-b {rotate y by -2}
+# No clockwise, counter-clockwise equivalents to VI ; just use G/g
+#user add key Control-a {scale by 1.1}	; # make larger (scaling)
+#user add key Control-z {scale by 0.9}	; # make smaller
+if {1<$dangerous} {
+## Move a part of mol, very dangerous, because unrecoverable and hard to detect
+user add key Left	{RC::Move " $RC::translate 0 0"}
+user add key Right	{RC::Move "-$RC::translate 0 0"}
+user add key Up		{RC::Move "0  $RC::translate 0"}
+user add key Down	{RC::Move "0 -$RC::translate 0"}
+user add key Home	{RC::Move "0 0  $RC::translate"}
+user add key End        {RC::Move "0 0 -$RC::translate"}
+user add key x {RC::Move "x  $RC::rotate"}
+user add key X {RC::Move "x -$RC::rotate"}
+user add key y {RC::Move "y  $RC::rotate"}
+user add key Y {RC::Move "y -$RC::rotate"}
+user add key z {RC::Move "z  $RC::rotate"}
+user add key Z {RC::Move "z -$RC::rotate"}
+} else {
+## Tranlation, less used than rotation
+user add key Left	{translate by  $RC::translate 0 0}
+user add key Right	{translate by -$RC::translate 0 0}
+user add key Up		{translate by 0  $RC::translate 0}
+user add key Down	{translate by 0 -$RC::translate 0}
+user add key Home	{translate by 0 0  $RC::translate}
+user add key End        {translate by 0 0 -$RC::translate}
+#user add key Home	{translate to 0 0 0}
+#user add key End { set RC::translate $RC::translate_switch([array names RC::translate_switch -exact $RC::translate]) }
+## Rocking rotate
+user add key x {rock x by 1 -1}
+user add key X {rock x by 1 70}
+user add key y {rock y by 1 -1}
+user add key Y {rock y by 1 70}
+user add key z {rock z by 1 -1}
+user add key Z {rock z by 1 70}
+#user add key \\ { display resetview ; animate goto start ; rock y by 1.0 90 ; animate forward }	; # view the profile of the mol
+}
+## QUIT COMMANDS
+user add key Alt-q {mol delete top}; # "q"uit top mol
+user add key Alt-Q {quit confirm}
+## MENU SHORTCUTS -- they close the open to guarantee the menu is on the top
+user add key Alt-m {menu main off ;	menu main on}
+user add key Alt-M {menu main off ;	menu main on}
+user add key Alt-f {menu files off ;	menu files on}
+user add key Alt-F {menu files off ;	menu files on}
+user add key Alt-g {menu graphics off ;	menu graphics on}
+user add key Alt-G {menu graphics off ;	menu graphics on}
+user add key Alt-f {menu files off ;	menu files on}
+user add key Alt-F {menu files off ;	menu files on}
+user add key Alt-l {menu labels off ;	menu labels on}
+user add key Alt-L {menu labels off ;	menu labels on}
+user add key Alt-r {menu render off ;	menu render on}
+user add key Alt-R {menu render off ;	menu render on}
+user add key Alt-d {menu display off ;	menu display on}
+user add key Alt-D {menu display off ;	menu display on}
+user add key Alt-c {menu color off ;	menu color on}
+user add key Alt-t {menu tool off ;	menu tool on}
+user add key Alt-T {menu tool off ;	menu tool on}
+user add key Alt-k {menu tkcon off ;	menu tkcon on}
+user add key Alt-K {menu tkcon off ;	menu tkcon on}
+user add key Alt-u {exec evince --page-index=100 $env(VMDDIR)/doc/ug.pdf &}
+user add key Alt-U {exec evince --page-index=100 $env(VMDDIR)/doc/ug.pdf &}
+## RESET DISPLAY
+#user add key Control-r {display resetview}
+user add key \= {display resetview}	; # Emulate SwissPDB Viewer
+user add key \+ {
+	if {"" ne $RC::emph(r.rep)} {
+		for {set RC::i 0} {[molinfo top get numreps]>$RC::i} {
+				incr RC::i} {
+			set RC::R [atomselect top [
+				molinfo top get "{selection [
+				mol repindex top $RC::emph(r.rep)]}"]]
+			set RC::c [measure center $RC::R]
+			$RC::R delete
+			set RC::S [atomselect top [
+				molinfo top get "{selection $RC::i}"]]
+			foreach RC::m [measure minmax $RC::S] {
+				if {20<[vecdist $RC::c $RC::m]} {
+					mol showrep top $RC::i off
+				}
+			}
+			$RC::S delete
+		}
+		mol showrep top [mol repindex top $RC::emph(r.rep)] on
+		display resetview
+	}
+}; # Hide large (many atoms) representations and auto zoom-in "+"
+user add key \- {
+	if {-1<[molinfo top]} {
+		for {set RC::i 0} {[molinfo top get numreps]>$RC::i} {
+				incr RC::i} {
+			mol showrep top $RC::i on
+		}
+		display resetview
+	}
+}; # Show all representations and auto zoom-out "-"
+user add key \_ { foreach m [molinfo list] { if {[molinfo top]!=$m} { mol off $m } } }; # hide other mol
+## Familiar controls for picking
+user add key r  {mouse mode rotate}
+# In rotate mode, the mouse changes the view by button:
+#	left: rotate left/right/up/down;
+#	middle: rotate clockwise/counter-clockwise.
+user add key t  {mouse mode translate}
+# In translate mode, the mouse changes the view by button:
+#	left: translate left/right/up/down;
+#	middle: translate forward/backward.
+user add key s  {mouse mode scale}
+user add key p  {mouse mode pick}	; # 'P'ick, highlight atoms nearby
+user add key 0  {mouse mode pick 0}	; # query
+user add key c  {mouse mode pick 1}	; # center
+user add key 1  {mouse mode pick 2}	; # atom
+user add key 2  {mouse mode pick 3}	; # bond
+user add key 3  {mouse mode pick 4}	; # angle
+user add key 4  {mouse mode pick 5}	; # dihedral
+if {1<$dangerous} {
+user add key 5  {mouse mode pick 6}	; # move atom
+user add key 6  {mouse mode pick 7}	; # move residue
+user add key 7  {mouse mode pick 8}	; # move fragment
+user add key 8  {mouse mode pick 9}	; # move molecule
+user add key 9  {mouse mode pick 13}	; # move highlighted rep
+# In moving mode, the mouse picks an atom, and moving atoms as the same
+#	atom/residue/fragment/molecule/rep of this atom, by button:
+#	left: translate left/right/up/down;
+#	shift+left: rotate left/right/up/down;
+#	shift+middle: rotate clockwise/counter-clockwise.
+#	Rotation is around the picked atom.
+user add key \% {mouse mode pick 10}	; # force atom
+user add key \^ {mouse mode pick 11}	; # force residue
+user add key \& {mouse mode pick 12}	; # force fragment
+}
+user add key P {
+	set RC::repname_tmp [list]
+	foreach RC::i $RC::pickmolrep {
+		if {[molinfo top]==[lindex $RC::i 0]} {
+			mol delrep [mol repindex {*}$RC::i] [lindex $RC::i 0]
+		} else {
+			lappend RC::repname_tmp $RC::i
+		}
+	}
+	set RC::pickmolrep $RC::repname_tmp
+	if {1<[llength $RC::pick_mol_atom_l]} {
+		puts "\n==Mol====index==RESresid:NAME==index=="
+		foreach RC::i $RC::pick_mol_atom_l {
+			puts [format {%5s %8s  %-13s %6s} [lindex $RC::i 0] [\
+				lindex $RC::i 1] "[lindex $RC::i 2 0][
+				lindex $RC::i 2 1]:[lindex $RC::i 2 3]" [
+				lindex $RC::i 2 2]]
+		}
+		set RC::pick_mol_atom_l [list]
+	} else {
+		puts "HOTKEYS) No picked atom in RC::pick_mol_atom_l!"
+	}
+	# $RC::pick_mol_atom_l is not synchronized with $RC::pickmolrep
+}; # clean displaying of "P"icked residue in CPK
+## Animation frame contols
+user add key \. {animate forward}
+user add key \, {animate reverse}
+user add key \/ {animate pause}
+user add key \? {animate skip $RC::animate_skip_switch([array names RC::animate_skip_switch -exact [animate skip]])}
+user add key \{ {animate goto start}
+user add key \} {animate goto end}
+user add key \[ {animate prev}
+user add key \] {animate next}
+## Select molecules
+user add key \( {RC::IncrTop -1 }; # previous mol
+user add key \) {RC::IncrTop +1 }; # next mol
+user add key \t { mol off top ; RC::IncrTop +1 ; display resetview }; # Tab
+## Change the display
+user add key T { axes location $RC::axes_location_switch([array names RC::axes_location_switch -exact [axes location]]) }; # axes loca"T"ion
+user add key C {
+	if {"black" eq [color Display Background]} {
+		color Display Background white
+		color Display Foreground black
+		color Display BackgroundTop white
+		color Display FPS black
+	} else {
+		color Display Background black
+		color Display Foreground white
+		color Display BackgroundTop black
+		color Display FPS white
+	}
+}; # background "C"olor
+user add key S { switch -glob -- [display get size
+	]  {800 *} {display resize 1024 768
+	} {1024 *} {display resize 1200 800
+	} {1200 *} {display resize 669 834; # the default of VMD
+	} default {display resize 800 600} }; # "S"creen size
+user add key R { RC::Render }; # "R"ender and save State
+## Lables
+user add key u { if {-1<[molinfo top]} { Label {%s:%R%d%a} \
+	{not sequence ".."  and not water and noh}}
+}; #"u"ser label (select non-protein atoms; 'protein' not work)
+user add key U { label delete Atoms }; # "U"nmark atoms
+user add key \~ {RC::LabelAtom -1};                         #Shift-`
+user add key \` {RC::LabelAtom +1};                         #Shift-5
+user add key \! {RC::LabelTranslate "-$RC::labeloffset 0"}; #Shift-1
+user add key \@ {RC::LabelTranslate "0 -$RC::labeloffset"}; #Shift-2
+user add key \# {RC::LabelTranslate "0  $RC::labeloffset"}; #Shift-3
+user add key \$ {RC::LabelTranslate " $RC::labeloffset 0"}; #Shift-4
+user add key m {
+	set RC::l [lsearch -all -index {0 0} -integer [label list Atoms] [
+		molinfo top]]
+	if {-1==$RC::labelatom} {
+		foreach RC::i $RC::l { label show Atoms $RC::i }
+		RC::LabelAtom
+	} else {
+		foreach RC::i $RC::l { label hide Atoms $RC::i }
+		set RC::labelatom -1
+	}; # avoid touching labels in other mols
+	puts $RC::labelatom
+}; # "m"ark atoms, toggle showing one/all labels of top mol
+user add key M {
+	namespace eval RC {
+		set label_hide_show [
+			expr {"hide" eq $label_hide_show?"show":"hide"}]
+		label $label_hide_show Atoms
+	}
+}; # "M"ark atoms, toggle show/hide all labels of all mol
+## Fit (align) the molecules
+if {0<$dangerous} {
+user add key F {foreach RC::i [molinfo list] {Fit "" now $RC::i top }}; # "F"it all frame of every mol to now of top
+user add key f {if {-1<[molinfo top]} {Fit}}; # "f"it all frames of top to now of top
+}
+## Atom Selection by keyboard
+user add key D {RC::Emph f -1}; # "D"omain
+user add key d {RC::Emph f +1}; # "d"omain
+user add key E {RC::Emph r -1}; # r"E"sidue
+user add key e {RC::Emph r +1}; # r"e"sidue
+user add key A {RC::Emph a -1}; # "A"tom
+user add key a {RC::Emph a +1}; # "a"tom
+user add key B {RC::Emph b -1}; # "B"onded atom
+user add key b {RC::Emph b +1}; # "b"onded atom
+if {1<$dangerous} {
+user add key Page_Down {RC::Dihedral -0.5}; # rotate the dihedralpart
+user add key Page_Up   {RC::Dihedral +0.5}; #	 of RC::Emph b
+}
+user add key w {
+	lappend RC::emph(memory) [list [molinfo top] $RC::emph(a.rep)]
+	set RC::emph(a.rep) ""
+}; # "w"rite emph(a.rep) (rep will keep no matter Emph changes)
+user add key W { set RC::emph(memory) {} }; # "W"ipe the memory
+## invert the current hyper text mode
+user add key Alt-h {hyperref invert}; # seems broken, see vmd/script/vmd/www.tcl
+## Get into literal cache mode, allowing complex command
+user add key \x1B {RC::CacheMode}; # key Escape
+foreach key [list Insert \b \r \x7F] name {Insert Backspace Return Delete} {
+	user add key "$key" "puts {HOTKEYS) no key $name in Normal mode!}"
+}
+## Help (F2 to F12 is free to be customized)
+user add key F1 {puts -nonewline {
+[~] label -	[!] label x -	[@] label y -	[#] label y +	[$] label x +	
+[`] label +	[1] pick atom	[2] pick bond	[3] pick angle	[4] pick dihed	
+		[5] move atom	[6] move res	[7] move frag	[8] move mol	
+		[%] force atom	[^] force res	[&] force frag	[*] ----	
+		[9] move rep	[0] query atom	[-] global view [=] reset view	
+		[(] prev top	[)] next top	[_] only top	[+] local view	
+----------------[Q] ----	[W]ipe emphmem	[E] rEs emph -	[R] endr	
+[Tab] next top	[q] ----	[w]rite emphmem	[e] rEs emph +	[r]otate mouse	
+		[T] axis locaT	[Y] rock y ++	[U]nuse marks	[I] scale ++	
+		[t]rans mouse	[y] rock y -	[u]ser labels	[i] scale +	
+		[O] scale --	[P]icked clear	[{] ani start	[}] ani end	
+		[o] scale -	[p]ick mouse 	[[] ani prev	[]] ani next	
+----------------[A]tom emph -	[S]creen size	[D]omain emph -	[F]it all mol	
+[Esc] CacheMode	[a]tom emph +	[s]cale mouse	[d]omain emph +	[f]it top mol	
+		[G] rotate z -	[H] rotate y -	[J] rotate x +	[K] rotate x -	
+		[g] rotate z +	[h] rotate y --	[j] rotate x ++	[k] rotate x --	
+		[L] rotate y +	[:] ----	["] ----	[BS] ----	
+		[l] rotate y ++	[;] ----	['] ----	[LF] ----	
+[PgUp] Dihed -	[Hom] trans z +	[Z] rock z ++	[X] rock x ++	[C] olor	
+[PgDn] Dihed +	[End] trans z -	[z] rock z -	[x] rock x -	[c] entr	
+		[V] ----	[B]onded emph +	[N] ----	[M]ark all mol	
+		[v] ----	[b]onded emph -	[n] ----	[m]ark top mol	
+		[<] ----	[>] ----	[?] ani skip	[|] ----	
+		[,] ani reverse	[.] ani forward	[/] ani pause	[\] ----	
+[F1] show help			[^U] trans y +			[Ins] ----	
+[Alt-u] ug.pdf	[<L] trans x -	[vD] trans y -  [>R] trans x +	[Del] ----	
+Tip) If modprobe nvidia_uvm is not permitted, `sudo nvidia-modprobe -u`.
+Tip) Run by optirun/primusrun if use Bumblebee.
+}}; # Help
+display update $vmd_hotkeys_tmp; # revert the display to its original status
+}
+
+}
+
+## turn on lights 0 and 1
+light 0 on
+light 1 on
+light 2 off
+light 3 off
+## position the stage and axes
+axes location lowerleft
+stage location off
+## position and turn on menus
+menu main     move 0   0
+menu display  move 395 30
+menu graphics move 470 0
+menu color    move 125 225
+menu files    move 125 325
+menu labels   move 893 0
+menu render   move 125 525
+#menu main     on
+#menu display  on
+#menu graphics on
+#menu color    on
+#menu labels   on
+#menu render   on
+#menu files    on
+## User's default values for newly loaded molecules/reps, etc
+#mol default color {colorID 5}
+#mol default style {NewCartoon 0.300000 6.000000 4.100000 0}
+#mol default selection {name CA}
+#mol default material {Transparent}
+if {-1<[lsearch [display get rendermodes] GLSL]} {
+	display rendermode GLSL; # introduce error for some X driver
+	display cachemode On; # introduce error for some X driver
+	mouse callback on
+	trace add variable vmd_pick_event write RC::Pick; # display the residue
+	RC::Hotkey 1
+}; # else may be in text mode (start vmd with -dispdev text)
+display projection Orthographic
+display depthcue off
+display shadows on; # Only Tachyon and TachyonInternal support shadow
+namespace import RC::*
+#set vmd_menu_extension ""; # default vmdprefs, but cannot unset here
+## The vmdprefs package can overwrite this file.  To avoid this, make a
+##	directory plugins/noarch/tcl/BROKEN, and move
+##	plugins/noarch/tcl/vmdprefs* into it.
+
+# vim: syntax=tcl :
